@@ -341,6 +341,92 @@ static uint32_t dis_find_memory_type(VkrDis* d, uint32_t bits, VkMemoryPropertyF
     return UINT32_MAX;
 }
 
+// Per-stage GPU timestamps for the bench (tools/dis-bench); compiled out of the app.
+#ifdef DIS_PROFILE
+#define DIS_PROF_MAX 64u
+static struct {
+    VkQueryPool pool;
+    PFN_vkCmdWriteTimestamp write;
+    PFN_vkCmdResetQueryPool reset;
+    PFN_vkGetQueryPoolResults get;
+    float period_ns;
+    const char* label[DIS_PROF_MAX];
+    uint32_t n;
+    const char* acc_label[DIS_PROF_MAX];
+    double acc_ms[DIS_PROF_MAX];
+    uint32_t acc_n;
+    uint64_t frames;
+} g_prof;
+
+static void dis_prof_mark(VkCommandBuffer cmd, const char* label) {
+    if (!g_prof.pool || g_prof.n >= DIS_PROF_MAX) return;
+    g_prof.write(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_prof.pool, g_prof.n);
+    g_prof.label[g_prof.n++] = label;
+}
+
+static void dis_prof_begin(VkrDis* d, VkCommandBuffer cmd) {
+    if (!g_prof.pool) {
+        g_prof.write = (PFN_vkCmdWriteTimestamp)vkd.GetDeviceProcAddr(d->device, "vkCmdWriteTimestamp");
+        g_prof.reset = (PFN_vkCmdResetQueryPool)vkd.GetDeviceProcAddr(d->device, "vkCmdResetQueryPool");
+        g_prof.get = (PFN_vkGetQueryPoolResults)vkd.GetDeviceProcAddr(d->device, "vkGetQueryPoolResults");
+        PFN_vkCreateQueryPool create =
+            (PFN_vkCreateQueryPool)vkd.GetDeviceProcAddr(d->device, "vkCreateQueryPool");
+        VkPhysicalDeviceProperties props;
+        vkd.GetPhysicalDeviceProperties(d->physical_device, &props);
+        g_prof.period_ns = props.limits.timestampPeriod;
+        VkQueryPoolCreateInfo qi;
+        memset(&qi, 0, sizeof(qi));
+        qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = DIS_PROF_MAX;
+        if (!create || create(d->device, &qi, NULL, &g_prof.pool) != VK_SUCCESS) return;
+    }
+    g_prof.reset(cmd, g_prof.pool, 0, DIS_PROF_MAX);
+    g_prof.n = 0;
+    dis_prof_mark(cmd, "start");
+}
+
+// Call once the frame's last submit has completed.
+void vkr_dis_profile_collect(VkrDis* d) {
+    if (!g_prof.pool || g_prof.n < 2) return;
+    uint64_t ts[DIS_PROF_MAX];
+    if (g_prof.get(d->device, g_prof.pool, 0, g_prof.n, sizeof(ts), ts, sizeof(uint64_t),
+                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS) return;
+    for (uint32_t i = 1; i < g_prof.n; i++) {
+        uint32_t k = 0;
+        while (k < g_prof.acc_n && strcmp(g_prof.acc_label[k], g_prof.label[i]) != 0) k++;
+        if (k == g_prof.acc_n) {
+            if (g_prof.acc_n >= DIS_PROF_MAX) continue;
+            g_prof.acc_label[g_prof.acc_n] = g_prof.label[i];
+            g_prof.acc_ms[g_prof.acc_n++] = 0.0;
+        }
+        g_prof.acc_ms[k] += (double)(ts[i] - ts[i - 1]) * g_prof.period_ns * 1e-6;
+    }
+    g_prof.frames++;
+    g_prof.n = 0;
+}
+
+void vkr_dis_profile_report(VkrDis* d) {
+    (void)d;
+    if (!g_prof.frames) return;
+    double total = 0;
+    for (uint32_t k = 0; k < g_prof.acc_n; k++) total += g_prof.acc_ms[k];
+    printf("PROFILE over %llu frames (ms per real frame):\n", (unsigned long long)g_prof.frames);
+    for (uint32_t k = 0; k < g_prof.acc_n; k++) {
+        printf("  %-18s %7.3f\n", g_prof.acc_label[k], g_prof.acc_ms[k] / (double)g_prof.frames);
+    }
+    printf("  %-18s %7.3f\n", "total", total / (double)g_prof.frames);
+    memset(g_prof.acc_ms, 0, sizeof(g_prof.acc_ms));
+    g_prof.acc_n = 0;
+    g_prof.frames = 0;
+}
+#define DIS_PROF_BEGIN(d, cmd) dis_prof_begin((d), (cmd))
+#define DIS_PROF(cmd, label) dis_prof_mark((cmd), (label))
+#else
+#define DIS_PROF_BEGIN(d, cmd) ((void)0)
+#define DIS_PROF(cmd, label) ((void)0)
+#endif
+
 static void dis_compute_barrier(VkCommandBuffer cmd) {
     VkMemoryBarrier mb;
     memset(&mb, 0, sizeof(mb));
@@ -971,13 +1057,11 @@ static void dis_write_all_descriptors(VkrDis* d) {
 
         dis_batch_sampled(d, &b, d->vr_sor_ab_set[l], 0, d->view_vr_A[l], d->sampler);
         dis_batch_sampled(d, &b, d->vr_sor_ab_set[l], 1, d->view_vr_B[l], d->sampler);
-        dis_batch_sampled(d, &b, d->vr_sor_ab_set[l], 2, d->view_vr_wt[l], d->sampler);
         dis_batch_sampled(d, &b, d->vr_sor_ab_set[l], 3, d->view_vr_dw[0][l], d->sampler);
         dis_batch_storage(d, &b, d->vr_sor_ab_set[l], DIS_VR_FIRST_STORAGE, d->view_vr_dw[1][l]);
 
         dis_batch_sampled(d, &b, d->vr_sor_ba_set[l], 0, d->view_vr_A[l], d->sampler);
         dis_batch_sampled(d, &b, d->vr_sor_ba_set[l], 1, d->view_vr_B[l], d->sampler);
-        dis_batch_sampled(d, &b, d->vr_sor_ba_set[l], 2, d->view_vr_wt[l], d->sampler);
         dis_batch_sampled(d, &b, d->vr_sor_ba_set[l], 3, d->view_vr_dw[1][l], d->sampler);
         dis_batch_storage(d, &b, d->vr_sor_ba_set[l], DIS_VR_FIRST_STORAGE, d->view_vr_dw[0][l]);
 
@@ -1217,7 +1301,7 @@ static bool dis_create_resources(VkrDis* d, uint32_t w, uint32_t h, uint32_t ful
                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) return false;
     if (!dis_create_image(d, &d->vr_A, w, h, VK_FORMAT_R32G32B32A32_SFLOAT, L,
                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) return false;
-    if (!dis_create_image(d, &d->vr_B, w, h, VK_FORMAT_R32G32_SFLOAT, L,
+    if (!dis_create_image(d, &d->vr_B, w, h, VK_FORMAT_R32G32B32A32_SFLOAT, L,
                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) return false;
     if (!dis_create_image(d, &d->vr_wt, w, h, VK_FORMAT_R32_SFLOAT, L,
                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) return false;
@@ -1267,7 +1351,7 @@ static bool dis_create_resources(VkrDis* d, uint32_t w, uint32_t h, uint32_t ful
         if (!dis_create_view(d, d->vr_d1.image, VK_FORMAT_R32G32B32A32_SFLOAT, l, 1, &d->view_vr_d1[l])) return false;
         if (!dis_create_view(d, d->vr_d2.image, VK_FORMAT_R32G32B32A32_SFLOAT, l, 1, &d->view_vr_d2[l])) return false;
         if (!dis_create_view(d, d->vr_A.image, VK_FORMAT_R32G32B32A32_SFLOAT, l, 1, &d->view_vr_A[l])) return false;
-        if (!dis_create_view(d, d->vr_B.image, VK_FORMAT_R32G32_SFLOAT, l, 1, &d->view_vr_B[l])) return false;
+        if (!dis_create_view(d, d->vr_B.image, VK_FORMAT_R32G32B32A32_SFLOAT, l, 1, &d->view_vr_B[l])) return false;
         if (!dis_create_view(d, d->vr_wt.image, VK_FORMAT_R32_SFLOAT, l, 1, &d->view_vr_wt[l])) return false;
         if (!dis_create_view(d, d->vr_dw[0].image, VK_FORMAT_R32G32_SFLOAT, l, 1, &d->view_vr_dw[0][l])) return false;
         if (!dis_create_view(d, d->vr_dw[1].image, VK_FORMAT_R32G32_SFLOAT, l, 1, &d->view_vr_dw[1][l])) return false;
@@ -1854,6 +1938,7 @@ static void dis_vr_level(VkrDis* d, VkCommandBuffer cmd, uint32_t slot, uint32_t
                                   &d->vr_d2_set[l], 0, NULL);
         vkd.CmdDispatch(cmd, gw, gh, 1);
         dis_compute_barrier(cmd);
+        if (l == 0) DIS_PROF(cmd, "L0 vr prep+deriv");
 
         for (uint32_t k = 0; k < vr_fixed_point; k++) {
             DisVrWPC wpc;
@@ -1866,6 +1951,7 @@ static void dis_vr_level(VkrDis* d, VkCommandBuffer cmd, uint32_t slot, uint32_t
                                  sizeof(wpc), &wpc);
             vkd.CmdDispatch(cmd, gw, gh, 1);
             dis_compute_barrier(cmd);
+            if (l == 0) DIS_PROF(cmd, "L0 vr w");
 
             DisVrCoefPC cpc;
             cpc.delta2 = DIS_VR_DELTA * 0.5f;
@@ -1879,29 +1965,28 @@ static void dis_vr_level(VkrDis* d, VkCommandBuffer cmd, uint32_t slot, uint32_t
                                  sizeof(cpc), &cpc);
             vkd.CmdDispatch(cmd, gw, gh, 1);
             dis_compute_barrier(cmd);
+            if (l == 0) DIS_PROF(cmd, "L0 vr coef");
 
+            // ab then ba per iteration, so every iteration ends in vr_dw[0]. Fusing iterations
+            // into shared-memory tiles was measured and lost on Adreno 750 (1.9 ms against 1.45
+            // at level 0 with a third of the dispatches), so the half-sweeps stay separate.
+            vkd.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->pass_vr_sor.pipeline);
             for (uint32_t it = 0; it < vr_sor; it++) {
-                DisVrSorPC spc;
-                spc.omega = DIS_VR_OMEGA;
-                spc.parity = 0;
-                vkd.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->pass_vr_sor.pipeline);
-                vkd.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                          d->vr_pipeline_layout, 0, 1, &d->vr_sor_ab_set[l], 0,
-                                          NULL);
-                vkd.CmdPushConstants(cmd, d->vr_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                     sizeof(spc), &spc);
-                vkd.CmdDispatch(cmd, gw, gh, 1);
-                dis_compute_barrier(cmd);
-
-                spc.parity = 1;
-                vkd.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                          d->vr_pipeline_layout, 0, 1, &d->vr_sor_ba_set[l], 0,
-                                          NULL);
-                vkd.CmdPushConstants(cmd, d->vr_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                     sizeof(spc), &spc);
-                vkd.CmdDispatch(cmd, gw, gh, 1);
-                dis_compute_barrier(cmd);
+                for (int parity = 0; parity < 2; parity++) {
+                    DisVrSorPC spc;
+                    spc.omega = DIS_VR_OMEGA;
+                    spc.parity = parity;
+                    vkd.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                              d->vr_pipeline_layout, 0, 1,
+                                              parity ? &d->vr_sor_ba_set[l] : &d->vr_sor_ab_set[l],
+                                              0, NULL);
+                    vkd.CmdPushConstants(cmd, d->vr_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                                         0, sizeof(spc), &spc);
+                    vkd.CmdDispatch(cmd, gw, gh, 1);
+                    dis_compute_barrier(cmd);
+                }
             }
+            if (l == 0) DIS_PROF(cmd, "L0 vr sor");
         }
     }
 
@@ -2064,6 +2149,7 @@ VkCommandBuffer vkr_dis_process_ex(VkrDis* d, VkCommandBuffer cmd, VkImage sourc
     d->me_primary_frame = false;
 
     dis_prime_layouts(d, cmd);
+    DIS_PROF_BEGIN(d, cmd);
 
     const DisRefine refine = dis_refine_for(generations);
     const uint32_t L = d->levels;
@@ -2128,6 +2214,7 @@ VkCommandBuffer vkr_dis_process_ex(VkrDis* d, VkCommandBuffer cmd, VkImage sourc
     }
 
     dis_compute_barrier(cmd);
+    DIS_PROF(cmd, "copy+luma");
 
     if (!wants_flow) return cmd;
     DisGradientPC gpc;
@@ -2147,7 +2234,13 @@ VkCommandBuffer vkr_dis_process_ex(VkrDis* d, VkCommandBuffer cmd, VkImage sourc
     }
 
     dis_compute_barrier(cmd);
+    DIS_PROF(cmd, "gradient");
 
+    static const char* const k_search[DIS_MAX_LEVELS] = {"L0 search", "L1 search", "L2 search", "L3 search", "L4 search", "L5 search", "L6 search", "L7 search"};
+    static const char* const k_vr[DIS_MAX_LEVELS] = {"L0 refine", "L1 refine", "L2 refine", "L3 refine", "L4 refine", "L5 refine", "L6 refine", "L7 refine"};
+    static const char* const k_inv[DIS_MAX_LEVELS] = {"L0 inverse", "L1 inverse", "L2 inverse", "L3 inverse", "L4 inverse", "L5 inverse", "L6 inverse", "L7 inverse"};
+    static const char* const k_prop[DIS_MAX_LEVELS] = {"L0 propagate", "L1 propagate", "L2 propagate", "L3 propagate", "L4 propagate", "L5 propagate", "L6 propagate", "L7 propagate"};
+    (void)k_search; (void)k_vr; (void)k_inv; (void)k_prop;
     for (uint32_t li = 0; li < L; li++) {
         const uint32_t l = coarse - li;
         // The hardware field already stands in for this level and everything above it.
@@ -2169,6 +2262,7 @@ VkCommandBuffer vkr_dis_process_ex(VkrDis* d, VkCommandBuffer cmd, VkImage sourc
                         (sph + DIS_LOCAL_SIZE - 1) / DIS_LOCAL_SIZE, 1);
 
         dis_compute_barrier(cmd);
+        DIS_PROF(cmd, k_inv[l]);
 
         uint32_t prop_passes = dis_prop_steps_for(l, L, refine.prop_floor);
         const uint32_t prop_doubling = prop_passes;
@@ -2189,13 +2283,16 @@ VkCommandBuffer vkr_dis_process_ex(VkrDis* d, VkCommandBuffer cmd, VkImage sourc
 
             dis_compute_barrier(cmd);
         }
+        DIS_PROF(cmd, k_prop[l]);
 
         dis_dispatch(d, cmd, d->pass_densify.pipeline, d->densify_sets[slot][l], lw, lh);
 
         dis_compute_barrier(cmd);
+        DIS_PROF(cmd, k_search[l]);
 
         if (l < refine.vr_levels) {
             dis_vr_level(d, cmd, slot, l, lw, lh, &refine, true);
+            DIS_PROF(cmd, k_vr[l]);
         }
     }
 
@@ -2223,6 +2320,7 @@ VkCommandBuffer vkr_dis_process_ex(VkrDis* d, VkCommandBuffer cmd, VkImage sourc
         // Which real frame a true occlusion takes, and how sure, per level-0 texel.
         dis_dispatch(d, cmd, d->pass_side.pipeline, d->side_sets[slot], w, h);
         dis_compute_barrier(cmd);
+        DIS_PROF(cmd, "pack+hist+side");
     }
     return cmd;
 }
@@ -2248,6 +2346,7 @@ static void dis_render_into(VkrDis* d, VkCommandBuffer cmd, float t, int debug_m
     vkd.CmdPushConstants(cmd, d->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ipc), &ipc);
     vkd.CmdDispatch(cmd, (w + DIS_LOCAL_SIZE - 1) / DIS_LOCAL_SIZE,
                     (h + DIS_LOCAL_SIZE - 1) / DIS_LOCAL_SIZE, 1);
+    DIS_PROF(cmd, "interp shader");
 
     dis_barrier(cmd, d->interp_out.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -2311,6 +2410,7 @@ static void dis_render_into(VkrDis* d, VkCommandBuffer cmd, float t, int debug_m
     dis_barrier(cmd, d->interp_out.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    DIS_PROF(cmd, "interp blit");
 }
 
 void vkr_dis_generate_into(VkrDis* d, VkCommandBuffer cmd, uint32_t generation,

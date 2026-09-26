@@ -89,54 +89,46 @@ mat2 myInverse(mat2 m) {
     return mat2(m[1][1], -m[0][1], -m[1][0], m[0][0]) / det;
 }
 
+// The reference patches of one workgroup. Patches sit every 3 texels and are 8 wide, so the
+// 8x8 patches of a workgroup cover a 29x29 block and overlap almost entirely; the block is loaded
+// once, cooperatively, instead of every thread keeping its own 64 luminance values and 64
+// gradients in private arrays - which is what the register file cannot hold on mobile GPUs, and
+// the spill to memory was the single most expensive thing in the flow chain. The values are the
+// same texels as before (texelFetch at the same clamped coordinates), so the search is unchanged.
+#define TILE 29
+shared float sLuma[TILE * TILE];
+shared vec2 sGrad[TILE * TILE];
+
+#define REF(i, j) sLuma[(lp.y + (j)) * TILE + lp.x + (i)]
+#define GRAD(i, j) sGrad[(lp.y + (j)) * TILE + lp.x + (i)]
+
 void main() {
     const float patchSize = 8.0;
 
     ivec2 pixSparse = ivec2(gl_GlobalInvocationID.xy);
     ivec2 sparseSize = imageSize(sparseFlowMap);
-    if (pixSparse.x >= sparseSize.x || pixSparse.y >= sparseSize.y) return;
-
-    ivec2 pix = pixSparse * 3;
     ivec2 denseSize = textureSize(lastLumaMap, 0);
     ivec2 denseMax = denseSize - 1;
 
-    float lastImageData[64];
-    vec2 gradData[64];
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 24;
+    for (int k = int(gl_LocalInvocationIndex); k < TILE * TILE; k += 64) {
+        ivec2 q = clamp(tileOrigin + ivec2(k % TILE, k / TILE), ivec2(0), denseMax);
+        sLuma[k] = texelFetch(lastLumaMap, q, 0).x;
+        sGrad[k] = -texelFetch(lastGradientMap, q, 0).xy;
+    }
+    barrier();
+
+    if (pixSparse.x >= sparseSize.x || pixSparse.y >= sparseSize.y) return;
+
+    ivec2 pix = pixSparse * 3;
+    ivec2 lp = ivec2(gl_LocalInvocationID.xy) * 3;
 
     vec2 gradSum = vec2(0.0);
     mat2 H = mat2(0.0);
 
-    // The patch is loaded as 4x4 quads with textureGather: one instruction per
-    // component per quad instead of one fetch per texel, three times fewer
-    // sample instructions for the same texels. The gathered order is
-    //   .w = (x, y), .z = (x+1, y), .x = (x, y+1), .y = (x+1, y+1)
-    // and the patch is indexed [x * 8 + y] to match the gradient descent loop.
-    vec2 invDense = 1.0 / vec2(denseSize);
-    for (int qy = 0; qy < 4; qy++) {
-        for (int qx = 0; qx < 4; qx++) {
-            ivec2 q = clamp(pix + ivec2(qx * 2, qy * 2), ivec2(0), denseMax);
-            vec2 corner = (vec2(q) + 1.0) * invDense;
-            vec4 lq = textureGather(lastLumaMap, corner, 0);
-            vec4 gx = textureGather(lastGradientMap, corner, 0);
-            vec4 gy = textureGather(lastGradientMap, corner, 1);
-
-            int x0 = qx * 2;
-            int y0 = qy * 2;
-            lastImageData[x0 * 8 + y0] = lq.w;
-            lastImageData[(x0 + 1) * 8 + y0] = lq.z;
-            lastImageData[x0 * 8 + y0 + 1] = lq.x;
-            lastImageData[(x0 + 1) * 8 + y0 + 1] = lq.y;
-
-            gradData[x0 * 8 + y0] = -vec2(gx.w, gy.w);
-            gradData[(x0 + 1) * 8 + y0] = -vec2(gx.z, gy.z);
-            gradData[x0 * 8 + y0 + 1] = -vec2(gx.x, gy.x);
-            gradData[(x0 + 1) * 8 + y0 + 1] = -vec2(gx.y, gy.y);
-        }
-    }
-
     for (int i = 0; i < 8; i++) {
         for (int j = 0; j < 8; j++) {
-            vec2 g = gradData[i * 8 + j];
+            vec2 g = GRAD(i, j);
             H[0][0] += g.x * g.x;
             H[1][1] += g.y * g.y;
             H[0][1] += g.x * g.y;
@@ -183,7 +175,7 @@ void main() {
                 for (int i = 0; i < 8; i++) {
                     for (int j = 0; j < 8; j++) {
                         vec2 tc = (o + vec2(i, j) + 0.5) * invImageSize;
-                        float diff = textureLod(nextLumaMap, tc, 0.0).x - lastImageData[i * 8 + j];
+                        float diff = textureLod(nextLumaMap, tc, 0.0).x - REF(i, j);
                         s += diff;
                         s2 += diff * diff;
                     }
@@ -210,10 +202,10 @@ void main() {
             for (int j = 0; j < 8; j++) {
                 vec2 tc = (warpOrigin + vec2(i, j) + 0.5) * invImageSize;
                 float warped = textureLod(nextLumaMap, tc, 0.0).x;
-                float diff = warped - lastImageData[i * 8 + j];
+                float diff = warped - REF(i, j);
                 sd += diff;
                 sd2 += diff * diff;
-                sIg += gradData[i * 8 + j] * diff;
+                sIg += GRAD(i, j) * diff;
             }
         }
 
@@ -250,7 +242,7 @@ void main() {
         for (int i = 0; i < 8; i++) {
             for (int j = 0; j < 8; j++) {
                 vec2 tc = (vec2(pix) + vec2(i, j) + 0.5) * invImageSize;
-                float diff = textureLod(nextLumaMap, tc, 0.0).x - lastImageData[i * 8 + j];
+                float diff = textureLod(nextLumaMap, tc, 0.0).x - REF(i, j);
                 zsd += diff;
                 zsd2 += diff * diff;
             }
